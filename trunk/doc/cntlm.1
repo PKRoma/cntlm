@@ -1,0 +1,328 @@
+.TH CNTLM 1 "May 2007" "cntlm 0.25" "Accelerating NTLM Authentication Proxy"
+.SH NAME
+\fBcntlm\fP \- authenticating HTTP(S) proxy with TCP/IP tunneling and acceleration
+
+.SH SYNOPSIS
+.B cntlm
+[
+.B \-cdLpuvw
+] [ \fIhost1\fP \fIport1\fP | \fIhost1\fP:\fIport1\fP ] ... \fIhostN\fP \fIportN\fP
+
+.SH DESCRIPTION
+\fBCntlm\fP is an authenticating proxy for HTTP communication. It takes the
+address of your proxy or proxies (\fIhost1..N\fP and \fIport1..N\fP) as a
+parameter and opens a listening socket, forwarding each request to one of them
+(moving in a circular list if the active parent proxy stops working). Along the
+way, the forwarded connection is created anew and authenticated or, if
+available, previously cached connection is reused to achieve higher efficiency
+and faster responses.  When the chain is set up, \fBcntlm\fP is to be used as
+the primary proxy in your applications. \fBCntlm\fP also itegrates transparent
+TCP/IP port forwarding (tunneling) through the parent proxy (incl.
+authentication). Each tunnel opens a new listening socket on the specified
+local port and forwards all TCP/IP connections to the given host:port behind
+the secondary proxy.  Manual page explains how to setup \fBcntlm\fP properly
+using configuration file or command\-line arguments.
+
+.PP
+Apparently, the authentication part is similar to NTLMAPS, but \fBcntlm\fP
+removes many of its shortcomings and inefficiencies. It supports real
+keep\-alive (on both sides) and it caches all authenticated connections for
+reuse in subsequent requests. It can be restarted without TIME_WAIT delay, uses
+just a fraction of memory compared to NTLMAPS and by orders of magnitude less
+CPU. Each thread is completely independent and one cannot block another.
+
+.PP
+In addition to lower usage of system resources, \fBcntlm\fP achieves higher
+throughput on a given link. By caching authenticated connections, it acts as an
+HTTP accelerator; instead of 5\-way auth handshake for each connection, it
+transparently removes this requirement, providing direct access most of the
+time. NTLMAPS doesn't do authentication together with the request \- instead,
+it first connects, sends a probe and disconnects. No sooner than that it
+connects again and initiates NTLM handshake. \fBCntlm\fP also doesn't read the
+clients complete request including HTTP body into memory, in fact, no traffic
+is generated except for the exchange of headers until the client <\-> server
+connection is fully negotiated. Only then are the request and response bodies
+multiplexed, directly between client and server sockets. This way, \fBcntlm\fP
+avoids most of the TCP/IP overhead of similar proxies. Along with the fact that
+\fBcntlm\fP is written in optimized C, it achieves up to ten times faster
+responses. The slower the line, the more impact \fBcntlm\fP has on download
+speeds.
+
+.PP
+An example of \fBcntlm\fP compared to NTLMAPS under the same conditions:
+\fBcntlm\fP gave avg 76 kB/s with peak CPU usage of 0.3% whereas with NTLMAPS
+it was avg 48 kB/s with peak CPU at 98% (Pentium M 1.8 GHz). The extreme
+difference in resource usage is one of many important benefits for laptop use.
+Peak memory consumption (several complex sites, 50 paralell connections/threads;
+values are in KiB):
+.nf
+
+       VSZ   RSS CMD
+      3204  1436 ./cntlm -f -c ./cntlm.conf -P pid
+    411604  6264 /usr/share/ntlmaps/main.py -c /etc/ntlmaps/server.cfg
+.fi
+
+.PP
+Inherent part of the development is profiling and memory management screening
+using Valgrind. The source distribution contains a file called
+\fIvalgrind.txt\fP, where you can see the report confirming zero leaks, no
+access to unallocated memory, no usage of uninitialized data - all tracked down
+to each CPU instruction emulated in Valgrind's virtual CPU during a typical
+production lifetime of the proxy. There are also some heap profiling graphs,
+which helped to halve the memory requirements of \fBcntlm\fP (removing regular
+expression matching in favour of \fI<string.h>\fP primitives).
+
+.SH OPTIONS
+Most options can be pre\-set in a configuration file. Specifying an option more
+than once is not an error, but \fBcntlm\fP ignores all occurences except the
+last one. This does not apply to options like \fB\-L\fP, each of which creates
+a new instance of some feature. \fBCntlm\fP can be built with a hardcoded
+configuration file (e.g. /etc/cntlm.conf), which is always loaded, if possible.
+See \fB\-c\fP option on how to override some or all of its settings.
+
+.TP 
+.B \-A \fBIP/mask\fP
+Allow ACL rule. Together with \fB-D\fP (Deny) they are the two rules allowed in
+ACL policy. It is more usual to have this in a configuration file, but
+\fBCntlm\fP follows the premise that you can do the same on the command\-line
+as you can using the config file. When \fBCntlm\fP receives a connection
+request, it decides whether to allow or deny it. All ACL rules are stored in a
+list in the same order as specified. \fBCntlm\fP then walks the list and the
+first \fIIP/mask\fP rule that matches the request source address is applied.
+The \fImask\fP can be any number from 0 to 32, where 32 is the default (that is
+exact IP match). This notation is also known as CIDR. If you want to match
+everything, use "0/0" or an asterix. ACLs on the command\-line take precedence
+over those in the config file. In such case, you will see info about that in
+the log (among the list of unused options). There you can also see warnings
+about possibly incorrect subnet spec, that's when the \fIIP\fP part has more
+bits than you declare by \fImask\fP (e.g. 10.20.30.40/24 should rather be
+10.20.30.0/24).
+
+.TP 
+.B \-a ntlm|lm|nt
+Authentication type. Basically, NTLM comprises of two hashed responses, NT and
+LM. Some servers might want just one of them, most likely LM (default is to use
+both). For now, \fBcntlm\fP does only NTLM, because other schemes usually have
+a good support in client applications, but if there's solid ground to support
+new authentication scheme implementation (like really \fBmany\fP ppl begging
+and stuff:)), I don't see why not.
+
+.TP 
+.B \-c <filename>
+Configuration file. Command\-line arguments can be used in combination with
+this one, overriding config file values. If no configuration file is specified
+and \fBcntlm\fP is built with SYSCONFDIR (default), it tries to load
+\fIcntlm.conf\fP from that directory. Should you then want to disable its
+loading, you will have to use \fB\-c\fP \fI/dev/null\fP on the command\-line to
+override it.
+
+.TP
+.B \-D IP/mask
+Deny ACL rule. See option \fB-A\fP above.
+
+.TP
+.B \-d <domain>
+The domain or workgroup of the proxy account. This value can also be specified
+as a part of the username with \fB\-u\fP.
+
+.TP
+.B \-f
+Run in console as a foreground job, do not fork into background. In this mode,
+all syslog messages will be echoed to the console (on platforms which support
+syslog LOG_PERROR option). Though \fBcntlm\fP is primarily designed as a
+classic UNIX daemon with syslogd logging, it provides detailed verbose mode
+without detaching from the controlling terminal; see \fB-v\fP. In any case, all
+error and diagnostic messages are always sent to the system logger.
+
+.TP
+.B \-g
+Gateway mode, \fBcntlm\fP listens on all network interfaces. Default is to bind
+just loopback. That way, only local processes can connect to
+\fBcntlm\fP. In the gateway mode though, \fBcntlm\fP listens on all interfaces
+and is accessible to other machines on the network. Please note that with this
+option the command\-line order matters when specifying proxy or tunnel local (listening)
+ports. Those positioned before it will bind only loopback; those after will be
+public. IMPORTANT: All of the above applies only to local ports, for which you
+didn't specify any source address. If you did, \fBcntlm\fP tries to bind the
+given port only on the specified interface (or rather IP address).
+
+.TP
+.B \-h \fB"<name>: <value>"\fP
+Header substitution. Every client's request will be processed and any headers
+defined using \fB-h\fP or in the configuration file will be added to it. In case
+the header is already present, its value will be replaced.
+
+.TP
+.B \-L [<saddr>:]<lport>:<rhost>:<rport>
+Tunnel specification. The syntax is the same as in OpenSSH's local forwarding
+(\fB\-L\fP), with a new optional prefix, \fIsaddr\fP - the source IP address to
+bind the \fIlport\fP to. \fBCntlm\fP will listen for incomming connections on
+the local port \fIlport\fP, forwarding every new connection through the parent
+proxy to the \fIrhost\fP:\fIrport\fP (authenticating on the go). This option
+can be used multiple times for unlimited number of tunnels, with or without the
+\fIsaddr\fP option. See \fB-g\fP for the details concerning local port binding
+when \fIsaddr\fP is not used.
+
+Please note that many corporate proxies do not allow connections to ports other
+than 443 (https), but if you run your target service on this port, you should
+be safe. Connect to HTTPS is "always" allowed, otherwise nobody would be able
+to browse https:// sites. In any case, first try if you can establish a
+connection through the tunnel, before you rely on it. This feature does the
+same job as tools like \fBcorkscrew(1)\fP, but instead of communicating over a
+terminal, \fBcntlm\fP keeps it TCP/IP.
+
+.TP
+.B \-l [<saddr>:]<lport>
+Local port for the \fBcntlm\fP proxy service. Use the number you have chosen
+here and the hostname of the machine running \fBcntlm\fP (possibly localhost)
+as proxy settings in your browser and/or the environment. Most applications
+(including console) support the notion of proxy to connect to other hosts. On
+POSIX, set the following variables to use e.g. \fBwget(1)\fP without any
+trouble (fill in the actual address of \fBcntlm\fP):
+.nf
+    $ export ftp_proxy=http://localhost:3128
+    $ export http_proxy=$ftp_proxy
+    $ export https_proxy=$ftp_proxy
+.fi
+
+You can choose to run the proxy service on more than one port, in such case
+just use this option as many times as neccessary. But unlike tunnel specification,
+\fBcntlm\fP fails to start if it cannot bind all of the proxy service ports.
+Proxy service port can also be bound selectively. Use \fIsaddr\fP to pick
+source IP address to bind the \fIlport\fP to. This allows you, for example, to
+run the service on different ports for subnet A and B and make it invisible for
+subnet C. See \fB-g\fP for the details concerning local port binding when
+\fIsaddr\fP is not used.
+
+.TP
+.B \-P <pidfile>
+Create a PID file \fIpidfile\fP upon startup. If the specified file exists, it
+is truncated and overwritten. This option is intended for use with
+\fBstart\-stop\-daemon(8)\fP and other servicing mechanisms. Please note that
+the PID file is created AFTER the process drops its privileges and forks. When
+the daemon finishes cleanly, the file is removed.
+
+.TP
+.B \-p <password>
+Proxy account password. You don't have to use configuration file to keep it
+private. \fBCntlm\fP deletes the password from the memory, so it cannot be
+seen in /proc or with process inspection tools like \fBps(1)\fP, etc.
+
+.TP
+.B \-U <uid>
+When executed as root, do the stuff that needs such permissions (read config,
+bind ports, etc.) and then immediately drop privileges and change to \fIuid\fP.
+This parameter can be either number or system username. If you use a number,
+both uid and gid of the process will be set to this value; if you specify a
+username, uid and gid will be set according to that user's uid and primary gid
+as defined in \fI/etc/passwd\fP. You should use the latter, possibly using a
+dedicated \fBcntlm\fP account. As with any daemon, you are \fBstrongly\fP
+advised to run \fBcntlm\fP under a non-privileged account.
+
+.TP
+.B \-u <user>[@<domain>]
+Proxy account/user name. Domain can be be entered as well.
+
+.TP
+.B \-v
+Print debugging information. This option enables foreground mode of operation
+(\fB\-f\fP) for you to be able to see the output and interact with the program.
+In case of any trouble, try to repeat the condition with this option and attach
+the whole output to the bug report.
+
+.TP
+.B \-w <workstation>
+Proxy account workstation NetBIOS name. Do not use full domain name (FQDN)
+here. Just the first part. Some proxies require this information.
+
+.SH FILES
+Configuration file has the same syntax as OpenSSH ssh_config. It comprises of
+whitespace delimited keywords and values. Comment begins with a hash '#' and
+can begin anywhere in the file. Everything after the hash up until the EOL is a
+comment. Values can contain any characters, including whitespace. Do not quote
+anything. For detailed explanation of keywords, see appropriate command-line
+options. Following keywords are available:
+
+.TP
+.B Allow <IP>[/<mask>]
+ACL allow rule, see \fB-A\fP.
+
+.TP
+.B Auth ntlm|lm|nt
+Select any possible combination of NTLM hashes using a single parameter.
+
+.TP
+.B Deny <IP>[/<mask>]
+ACL deny rule, see \fB-A\fP.
+
+.TP
+.B Domain <domain_name>
+Proxy account domain/workgroup name.
+
+.TP
+.B Gateway yes|no
+Gateway mode. In the configuration file, order doesn't matter. Gateway mode
+applies the same to all tunnels.
+
+.TP
+.B Header <headername: value>
+Header substitution. See \fB-h\fP for details and remember, no quoting.
+
+.TP
+.B Listen [<saddr>:]<port_number>
+Local port number for the \fBcntlm\fP's proxy service. See \fB-l\fP for more.
+
+.TP
+.B Password <password>
+Proxy account password.
+
+.TP
+.B Proxy <host:port>
+Parent proxy, which requires authentication. The same as proxy on the
+command\-line, can be used more than once to specify unlimited number of
+proxies. Should one proxy fail, \fBcntlm\fP automatically moves on to the
+next one. The connect request fails only if the whole list of proxies is
+scanned and (for each request) and found to be invalid. Command\-line takes
+precedence over the configuration file.
+
+.TP
+.B Tunnel [<saddr>:]<lport>:<rhost>:<rport>
+Tunnel specification. See \fB-L\fP for more.
+
+.TP
+.B Username 
+Proxy account name, without the possibility to include domain name ('at' sign
+is interpreted literally).
+
+.SH PORTING
+\fBCntlm\fP has been successfully compiled and tested on both little and big
+endian machines (Linux/i386 and AIX/PowerPC). For compilation details, see
+README in the source distribution. Porting to any POSIX conforming OS shouldn't
+be more than a matter of the Makefile rearrangement. \fBCntlm\fP uses strictly
+POSIX.1c interfaces with ISO C99 libc (\fBsnprintf(3)\fP), it is also fully
+compliant with SUSv2.
+
+.SH TODO
+In the much needed NTLM-proxy departement, \fBcntlm\fP aims to be a drop\-in
+replacement for NTLMAPS. But please note that NTLM WWW auth (that is auth to
+HTTP servers), when it is running without any parent proxy as a standalone
+proxy server in itself, won't probaly be implemented ever. Even though the
+tasks share common NTLM authentication, they are different things. Also, I've
+never seen any access-protected HTTP server requiring solely NTLM without any
+alternative. Such a narrow-spectrum tool can be written in Perl in a few
+minutes. I strive to keep the code of \fBcntlm\fP simple and efficient.
+
+.SH BUGS
+This software is in the BETA phase of development, so there are probably many
+bugs for you to uncloak even though I'm testing every new piece of code AMAP
+and use \fBcntlm\fP daily. I'll be happy to fix all of them, but if you can
+manage, patches would be better. ;)
+
+.SH AUTHOR
+Written by David Kubicek <dave@awk.cz>
+
+.SH COPYRIGHT
+Copyright \(co 2007 David Kubicek
+.br
+\fBCntlm\fP uses DES and MD4 routines from gnulib and Base64 routines from
+\fBmutt(1)\fP.
