@@ -53,12 +53,12 @@
 #include "swap.h"
 #include "config.h"
 #include "acl.h"
+#include "auth.h"
 #include "pages.c"
 
 #define DEFAULT_PORT	"3128"
 
 #define BLOCK		2048
-#define MINIBUF_SIZE	100
 #define SAMPLE		4096
 #define STACK_SIZE	sizeof(void *)*8*1024
 
@@ -76,22 +76,13 @@
 #define GET(data)	(data && data->req && !strcasecmp("GET", data->method))
 
 /*
- * Global read-only data initialized in main(). Comments list funcs. which use
+ * Global "read-only" data initialized in main(). Comments list funcs. which use
  * them. Having these global avoids the need to pass them to each thread and
  * from there again a few times to inner calls.
  */
 int debug = 0;						/* all debug printf's and possibly external modules */
 
-static char *user;					/* authenticate() */
-static char *domain;
-static char *workstation;
-static char *passlm = NULL;
-static char *passnt = NULL;
-static char *passntlm2 = NULL;
-static int hashntlm2 = 1;
-static int hashnt = 0;
-static int hashlm = 0;
-static uint32_t flags = 0;
+static struct auth_s *creds = NULL;			/* throughout the whole module */
 
 static int quit = 0;					/* sighandler() */
 static int asdaemon = 1;				/* myexit() */
@@ -793,7 +784,7 @@ int tunnel(int cd, int sd) {
  * error if not NULL, so it can be forwarded to the client. Caller
  * must then free it!
  */
-int authenticate(int sd, rr_data_t data, char *user, char *passntlm2, char *passnt, char *passlm, char *domain, int silent, int *closed) {
+int authenticate(int sd, rr_data_t data, struct auth_s *creds, int silent, int *closed) {
 	char *tmp, *buf, *challenge;
 	rr_data_t auth;
 	int len, rc;
@@ -804,7 +795,7 @@ int authenticate(int sd, rr_data_t data, char *user, char *passntlm2, char *pass
 	buf = new(BUFSIZE);
 
 	strcpy(buf, "NTLM ");
-	len = ntlm_request(&tmp, workstation, domain, hashntlm2, hashnt, hashlm, flags);
+	len = ntlm_request(&tmp, creds);
 	to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
 	free(tmp);
 	
@@ -855,7 +846,7 @@ int authenticate(int sd, rr_data_t data, char *user, char *passntlm2, char *pass
 			challenge = new(strlen(tmp));
 			len = from_base64(challenge, tmp+5);
 			if (len > NTLM_CHALLENGE_MIN) {
-				len = ntlm_response(&tmp, challenge, len, user, passntlm2, passnt, passlm, workstation, domain, hashntlm2, hashnt, hashlm);
+				len = ntlm_response(&tmp, challenge, len, creds);
 				if (len > 0) {
 					strcpy(buf, "NTLM ");
 					to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
@@ -933,7 +924,7 @@ int make_connect(int sd, const char *thost) {
 	if (debug)
 		printf("Starting authentication...\n");
 
-	ret = authenticate(sd, data1, user, passntlm2, passnt, passlm, domain, 0, &closed);
+	ret = authenticate(sd, data1, creds, 0, &closed);
 	if (ret && ret != 500) {
 		if (closed || so_closed(sd)) {
 			close(sd);
@@ -1206,7 +1197,7 @@ int scanner_hook(rr_data_t *request, rr_data_t *response, int *cd, int *sd, long
 					nc = i;
 				} else {
 					nc = proxy_connect();
-					c = authenticate(nc, newreq, user, passntlm2, passnt, passlm, domain, 0, NULL);
+					c = authenticate(nc, newreq, creds, 0, NULL);
 					if (c > 0 && c != 500) {
 						if (debug)
 							printf("scanner_hook: Authentication OK, getting the file...\n");
@@ -1301,7 +1292,7 @@ void *process(void *client) {
 	rr_data_t data[2], errdata;
 	hlist_t tl;
 	char *tmp, *buf, *pos, *dom;
-	char *puser, *ppassntlm2, *ppassnt, *ppasslm, *pdomain;		/* Per-thread credentials; for NTLM-to-basic */
+	struct auth_s *tcreds;						/* Per-thread credentials; for NTLM-to-basic */
 
 	int cd = (int)client;
 	int authok = 0;
@@ -1325,21 +1316,16 @@ void *process(void *client) {
 	if (!sd)
 		sd = proxy_connect();
 
-	puser = new(MINIBUF_SIZE);
-	ppassntlm2 = new(MINIBUF_SIZE);
-	ppassnt = new(MINIBUF_SIZE);
-	ppasslm = new(MINIBUF_SIZE);
-	pdomain = new(MINIBUF_SIZE);
-
-	strlcpy(pdomain, domain, MINIBUF_SIZE);
+	tcreds = new_auth();
+	strlcpy(tcreds->domain, creds->domain, MINIBUF_SIZE);
 	if (!ntlmbasic) {
-		strlcpy(puser, user, MINIBUF_SIZE);
-		if (passntlm2)
-			memcpy(ppassntlm2, passntlm2, 16);
-		if (passnt)
-			memcpy(ppassnt, passnt, 21);
-		if (passlm)
-			memcpy(ppasslm, passlm, 21);
+		strlcpy(tcreds->user, creds->user, MINIBUF_SIZE);
+		if (creds->passntlm2)
+			memcpy(tcreds->passntlm2, creds->passntlm2, 16);
+		if (creds->passnt)
+			memcpy(tcreds->passnt, creds->passnt, 21);
+		if (creds->passlm)
+			memcpy(tcreds->passlm, creds->passlm, 21);
 	}
 
 	if (sd <= 0)
@@ -1427,32 +1413,32 @@ void *process(void *client) {
 				} else {
 					dom = strchr(buf, '\\');
 					if (dom == NULL) {
-						strlcpy(puser, buf, MIN(MINIBUF_SIZE, pos-buf+1));
+						strlcpy(tcreds->user, buf, MIN(MINIBUF_SIZE, pos-buf+1));
 					} else {
-						strlcpy(pdomain, buf, MIN(MINIBUF_SIZE, dom-buf+1));
-						strlcpy(puser, dom+1, MIN(MINIBUF_SIZE, pos-dom));
+						strlcpy(tcreds->domain, buf, MIN(MINIBUF_SIZE, dom-buf+1));
+						strlcpy(tcreds->user, dom+1, MIN(MINIBUF_SIZE, pos-dom));
 					}
 
-					if (hashntlm2) {
-						tmp = ntlm2_hash_password(puser, pdomain, pos+1);
-						memcpy(ppassntlm2, tmp, 16);
+					if (creds->hashntlm2) {
+						tmp = ntlm2_hash_password(tcreds->user, tcreds->domain, pos+1);
+						memcpy(tcreds->passntlm2, tmp, 16);
 						free(tmp);
 					}
 
-					if (hashnt) {
+					if (creds->hashnt) {
 						tmp = ntlm_hash_nt_password(pos+1);
-						memcpy(ppassnt, tmp, 21);
+						memcpy(tcreds->passnt, tmp, 21);
 						free(tmp);
 					}
 
-					if (hashlm) {
+					if (creds->hashlm) {
 						tmp = ntlm_hash_lm_password(pos+1);
-						memcpy(ppasslm, tmp, 21);
+						memcpy(tcreds->passlm, tmp, 21);
 						free(tmp);
 					}
 
 					if (debug) {
-						printf("NTLM-to-basic: Credentials parsed: %s\\%s at %s\n", pdomain, puser, workstation);
+						printf("NTLM-to-basic: Credentials parsed: %s\\%s at %s\n", tcreds->domain, tcreds->user, creds->workstation);
 					}
 
 					memset(buf, 0, strlen(buf));
@@ -1518,7 +1504,7 @@ void *process(void *client) {
 			 */
 			if (!loop && data[0]->req && !authok) {
 				errdata = NULL;
-				if (!(i = authenticate(*wsocket[0], data[0], puser, ppassntlm2, ppassnt, ppasslm, pdomain, 0, &closed)))
+				if (!(i = authenticate(*wsocket[0], data[0], tcreds, 0, &closed)))
 					syslog(LOG_ERR, "Authentication requests failed. Will try without.\n");
 
 				if (!i || closed || so_closed(sd)) {
@@ -1675,11 +1661,7 @@ void *process(void *client) {
 	} while (!so_closed(sd) && !so_closed(cd) && !serialize && (keep || so_dataready(cd)));
 
 bailout:
-	free(puser);
-	free(ppassntlm2);
-	free(ppassnt);
-	free(ppasslm);
-	free(pdomain);
+	auth_free(tcreds);
 
 	if (debug)
 		printf("\nThread finished.\n");
@@ -1725,7 +1707,7 @@ void *precache_thread(void *data) {
 			data1->url = strdup("http://www.google.com/");
 			data1->http = strdup("1");
 
-			i = authenticate(sd, data1, user, passntlm2, passnt, passlm, domain, 1, &closed);
+			i = authenticate(sd, data1, creds, 1, &closed);
 			if (i && i == 1 && !closed && !so_closed(sd) && headers_send(sd, data1) && headers_recv(sd, data2) && data2->code == 302) {
 				tmp = hlist_get(data2->headers, "Content-Length");
 				if (tmp)
@@ -2057,7 +2039,7 @@ void magic_auth_detect(const char *url) {
 
 	debug = 0;
 
-	if (!passnt || !passlm || !passntlm2) {
+	if (!creds->passnt || !creds->passlm || !creds->passntlm2) {
 		printf("Cannot detect NTLM dialect - password or its hashes must be defined, try -I\n");
 		exit(1);
 	}
@@ -2083,10 +2065,10 @@ void magic_auth_detect(const char *url) {
 		if (host)
 			req->headers = hlist_add(req->headers, "Host", host, 1, 1);
 
-		hashnt = prefs[i][0];
-		hashlm = prefs[i][1];
-		hashntlm2 = prefs[i][2];
-		flags = prefs[i][3];
+		creds->hashnt = prefs[i][0];
+		creds->hashlm = prefs[i][1];
+		creds->hashntlm2 = prefs[i][2];
+		creds->flags = prefs[i][3];
 
 		printf("Config profile %2d/%d... ", i+1, MAGIC_TESTS);
 
@@ -2101,7 +2083,7 @@ void magic_auth_detect(const char *url) {
 			return;
 		}
 
-		c = authenticate(nc, req, user, passntlm2, passnt, passlm, domain, 0, &closed);
+		c = authenticate(nc, req, creds, 0, &closed);
 		if (c <= 0 || c == 500 || closed) {
 			printf("Auth request ignored (HTTP code: %d)\n", c);
 			free_rr_data(res);
@@ -2141,15 +2123,15 @@ void magic_auth_detect(const char *url) {
 		if (prefs[found][3])
 			printf("Flags           0x%x\n", prefs[found][3]);
 		if (prefs[found][0]) {
-			printf("PassNT          %s\n", tmp=printmem(passnt, 16, 8));
+			printf("PassNT          %s\n", tmp=printmem(creds->passnt, 16, 8));
 			free(tmp);
 		}
 		if (prefs[found][1]) {
-			printf("PassLM          %s\n", tmp=printmem(passlm, 16, 8));
+			printf("PassLM          %s\n", tmp=printmem(creds->passlm, 16, 8));
 			free(tmp);
 		}
 		if (prefs[found][2]) {
-			printf("PassNTLMv2      %s\n", tmp=printmem(passntlm2, 16, 8));
+			printf("PassNTLMv2      %s\n", tmp=printmem(creds->passntlm2, 16, 8));
 			free(tmp);
 		}
 		printf("------------------------------------------------\n");
@@ -2170,8 +2152,9 @@ void carp(const char *msg, int console) {
 }
 
 int main(int argc, char **argv) {
-	char *tmp, *head, *uid, *pidfile, *auth;
-	char *password, *cpassntlm2, *cpassnt, *cpasslm;
+	char *tmp, *head;
+	char *cpassword, *cpassntlm2, *cpassnt, *cpasslm, *cuid, *cpidfile, *cauth;
+	int cflags;
 	struct passwd *pw;
 	struct termios termold, termnew;
 	pthread_attr_t pattr;
@@ -2196,16 +2179,16 @@ int main(int argc, char **argv) {
 	config_t cf = NULL;
 	char *magic_detect = NULL;
 
-	user = new(MINIBUF_SIZE);
-	domain = new(MINIBUF_SIZE);
-	password = new(MINIBUF_SIZE);
+	cuser = new(MINIBUF_SIZE);
+	cdomain = new(MINIBUF_SIZE);
+	cpassword = new(MINIBUF_SIZE);
 	cpassntlm2 = new(MINIBUF_SIZE);
 	cpassnt = new(MINIBUF_SIZE);
 	cpasslm = new(MINIBUF_SIZE);
-	workstation = new(MINIBUF_SIZE);
-	pidfile = new(MINIBUF_SIZE);
-	uid = new(MINIBUF_SIZE);
-	auth = new(MINIBUF_SIZE);
+	cworkstation = new(MINIBUF_SIZE);
+	cpidfile = new(MINIBUF_SIZE);
+	cuid = new(MINIBUF_SIZE);
+	cauth = new(MINIBUF_SIZE);
 
 	openlog("cntlm", LOG_CONS, LOG_DAEMON);
 
@@ -2223,7 +2206,7 @@ int main(int argc, char **argv) {
 					myexit(1);
 				break;
 			case 'a':
-				strlcpy(auth, optarg, MINIBUF_SIZE);
+				strlcpy(cauth, optarg, MINIBUF_SIZE);
 				break;
 			case 'B':
 				ntlmbasic = 1;
@@ -2235,10 +2218,10 @@ int main(int argc, char **argv) {
 				}
 				break;
 			case 'd':
-				strlcpy(domain, optarg, MINIBUF_SIZE);
+				strlcpy(cdomain, optarg, MINIBUF_SIZE);
 				break;
 			case 'F':
-				flags = swap32(strtoul(optarg, &tmp, 0));
+				cflags = swap32(strtoul(optarg, &tmp, 0));
 				break;
 			case 'f':
 				asdaemon = 0;
@@ -2283,14 +2266,14 @@ int main(int argc, char **argv) {
 				listen_add("SOCKS5 proxy", &socksd_list, optarg, gateway);
 				break;
 			case 'P':
-				strlcpy(pidfile, optarg, MINIBUF_SIZE);
+				strlcpy(cpidfile, optarg, MINIBUF_SIZE);
 				break;
 			case 'p':
 				/*
 				 * Overwrite the password parameter with '*'s to make it
 				 * invisible in "ps", /proc, etc.
 				 */
-				strlcpy(password, optarg, MINIBUF_SIZE);
+				strlcpy(cpassword, optarg, MINIBUF_SIZE);
 				for (i = strlen(optarg)-1; i >= 0; --i)
 					optarg[i] = '*';
 				break;
@@ -2338,15 +2321,15 @@ int main(int argc, char **argv) {
 				}
 				break;
 			case 'U':
-				strlcpy(uid, optarg, MINIBUF_SIZE);
+				strlcpy(cuid, optarg, MINIBUF_SIZE);
 				break;
 			case 'u':
 				i = strcspn(optarg, "@");
 				if (i != strlen(optarg)) {
-					strlcpy(user, optarg, MIN(MINIBUF_SIZE, i+1));
-					strlcpy(domain, optarg+i+1, MINIBUF_SIZE);
+					strlcpy(cuser, optarg, MIN(MINIBUF_SIZE, i+1));
+					strlcpy(cdomain, optarg+i+1, MINIBUF_SIZE);
 				} else {
-					strlcpy(user, optarg, MINIBUF_SIZE);
+					strlcpy(cuser, optarg, MINIBUF_SIZE);
 				}
 				break;
 			case 'v':
@@ -2355,7 +2338,7 @@ int main(int argc, char **argv) {
 				openlog("cntlm", LOG_CONS | LOG_PERROR, LOG_DAEMON);
 				break;
 			case 'w':
-				strlcpy(workstation, optarg, MINIBUF_SIZE);
+				strlcpy(cworkstation, optarg, MINIBUF_SIZE);
 				break;
 			case 'h':
 			default:
@@ -2554,19 +2537,19 @@ int main(int argc, char **argv) {
 		/*
 		 * Single options.
 		 */
-		CFG_DEFAULT(cf, "Auth", auth, MINIBUF_SIZE);
-		CFG_DEFAULT(cf, "Domain", domain, MINIBUF_SIZE);
-		CFG_DEFAULT(cf, "Password", password, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Auth", cauth, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Domain", cdomain, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Password", cpassword, MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "PassNTLMv2", cpassntlm2, MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "PassNT", cpassnt, MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "PassLM", cpasslm, MINIBUF_SIZE);
-		CFG_DEFAULT(cf, "Username", user, MINIBUF_SIZE);
-		CFG_DEFAULT(cf, "Workstation", workstation, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Username", cuser, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Workstation", cworkstation, MINIBUF_SIZE);
 
 		tmp = new(MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "Flags", tmp, MINIBUF_SIZE);
-		if (!flags)
-			flags = swap32(strtoul(tmp, NULL, 0));
+		if (!cflags)
+			cflags = swap32(strtoul(tmp, NULL, 0));
 		free(tmp);
 
 		tmp = new(MINIBUF_SIZE);
@@ -2621,10 +2604,10 @@ int main(int argc, char **argv) {
 
 	config_close(cf);
 
-	if (!ntlmbasic && !strlen(user))
+	if (!ntlmbasic && !strlen(cuser))
 		carp("Parent proxy account username missing.\n", interactivehash || interactivepwd || magic_detect);
 
-	if (!ntlmbasic && !strlen(domain))
+	if (!ntlmbasic && !strlen(cdomain))
 		carp("Parent proxy account domain missing.\n", interactivehash || interactivepwd || magic_detect);
 
 	if (!interactivehash && !parent_list)
@@ -2636,40 +2619,40 @@ int main(int argc, char **argv) {
 	/*
 	 * Set default value for the workstation. Hostname if possible.
 	 */
-	if (!strlen(workstation)) {
+	if (!strlen(cworkstation)) {
 #if config_gethostname == 1
-		gethostname(workstation, MINIBUF_SIZE);
+		gethostname(cworkstation, MINIBUF_SIZE);
 #endif
-		if (!strlen(workstation))
-			strlcpy(workstation, "cntlm", MINIBUF_SIZE);
+		if (!strlen(cworkstation))
+			strlcpy(cworkstation, "cntlm", MINIBUF_SIZE);
 
-		syslog(LOG_INFO, "Workstation name used: %s\n", workstation);
+		syslog(LOG_INFO, "Workstation name used: %s\n", cworkstation);
 	}
 
 	/*
 	 * Parse selected NTLM hash combination.
 	 */
-	if (strlen(auth)) {
-		if (!strcasecmp("ntlm", auth)) {
-			hashnt = 1;
-			hashlm = 1;
-			hashntlm2 = 0;
-		} else if (!strcasecmp("nt", auth)) {
-			hashnt = 1;
-			hashlm = 0;
-			hashntlm2 = 0;
-		} else if (!strcasecmp("lm", auth)) {
-			hashnt = 0;
-			hashlm = 1;
-			hashntlm2 = 0;
-		} else if (!strcasecmp("ntlmv2", auth)) {
-			hashnt = 0;
-			hashlm = 0;
-			hashntlm2 = 1;
-		} else if (!strcasecmp("ntlm2sr", auth)) {
-			hashnt = 2;
-			hashlm = 0;
-			hashntlm2 = 0;
+	if (strlen(cauth)) {
+		if (!strcasecmp("ntlm", cauth)) {
+			creds->hashnt = 1;
+			creds->hashlm = 1;
+			creds->hashntlm2 = 0;
+		} else if (!strcasecmp("nt", cauth)) {
+			creds->hashnt = 1;
+			creds->hashlm = 0;
+			creds->hashntlm2 = 0;
+		} else if (!strcasecmp("lm", cauth)) {
+			creds->hashnt = 0;
+			creds->hashlm = 1;
+			creds->hashntlm2 = 0;
+		} else if (!strcasecmp("ntlmv2", cauth)) {
+			creds->hashnt = 0;
+			creds->hashlm = 0;
+			creds->hashntlm2 = 1;
+		} else if (!strcasecmp("ntlm2sr", cauth)) {
+			creds->hashnt = 2;
+			creds->hashlm = 0;
+			creds->hashntlm2 = 0;
 		} else {
 			syslog(LOG_ERR, "Unknown NTLM auth combination.\n");
 			myexit(1);
@@ -2680,10 +2663,10 @@ int main(int argc, char **argv) {
 		syslog(LOG_WARNING, "SOCKS5 proxy will NOT require any authentication\n");
 
 	if (!magic_detect)
-		syslog(LOG_INFO, "Using following NTLM hashes: NTLMv2(%d) NT(%d) LM(%d)\n", hashntlm2, hashnt, hashlm);
+		syslog(LOG_INFO, "Using following NTLM hashes: NTLMv2(%d) NT(%d) LM(%d)\n", creds->hashntlm2, creds->hashnt, creds->hashlm);
 
-	if (flags)
-		syslog(LOG_INFO, "Using manual NTLM flags: 0x%X\n", swap32(flags));
+	if (cflags)
+		syslog(LOG_INFO, "Using manual NTLM flags: 0x%X\n", swap32(cflags));
 
 	/*
 	 * Last chance to get password from the user
@@ -2694,10 +2677,10 @@ int main(int argc, char **argv) {
 		termnew = termold;
 		termnew.c_lflag &= ~(ISIG | ECHO);
 		tcsetattr(0, TCSADRAIN, &termnew);
-		fgets(password, MINIBUF_SIZE, stdin);
+		fgets(cpassword, MINIBUF_SIZE, stdin);
 		tcsetattr(0, TCSADRAIN, &termold);
-		i = strlen(password)-1;
-		trimr(password);
+		i = strlen(cpassword)-1;
+		trimr(cpassword);
 		printf("\n");
 	}
 
@@ -2708,44 +2691,57 @@ int main(int argc, char **argv) {
 	 * If plain password is present, calculate its NT and LM hashes 
 	 * and remove it from the memory.
 	 */
-	if (!strlen(password)) {
+	if (!strlen(cpassword)) {
 		if (strlen(cpassntlm2)) {
-			passntlm2 = scanmem(cpassntlm2, 8);
-			if (!passntlm2) {
+			tmp = scanmem(cpassntlm2, 8);
+			if (!tmp) {
 				syslog(LOG_ERR, "Invalid PassNTLMv2 hash, terminating\n");
 				exit(1);
 			}
-			passntlm2 = realloc(passntlm2, 21 + 1);
-			memset(passntlm2+16, 0, 5);
+			memcpy(creds->passntlm2, tmp, 16);
+			memset(creds->passntlm2+16, 0, 5);
 		}
 		if (strlen(cpassnt)) {
-			passnt = scanmem(cpassnt, 8);
-			if (!passnt) {
+			tmp = scanmem(cpassnt, 8);
+			if (!tmp) {
 				syslog(LOG_ERR, "Invalid PassNT hash, terminating\n");
 				exit(1);
 			}
-			passnt = realloc(passnt, 21 + 1);
-			memset(passnt+16, 0, 5);
+			memcpy(creds->passnt, tmp, 16);
+			memset(creds->passnt+16, 0, 5);
 		}
 		if (strlen(cpasslm)) {
-			passlm = scanmem(cpasslm, 8);
-			if (!passlm) {
+			tmp = scanmem(cpasslm, 8);
+			if (!tmp) {
 				syslog(LOG_ERR, "Invalid PassLM hash, terminating\n");
 				exit(1);
 			}
-			passlm = realloc(passlm, 21 + 1);
-			memset(passlm+16, 0, 5);
+			memcpy(creds->passlm, tmp, 16);
+			memset(creds->passlm+16, 0, 5);
 		}
 	} else {
-		if (hashnt || magic_detect || interactivehash)
-			passnt = ntlm_hash_nt_password(password);
-		if (hashlm || magic_detect || interactivehash)
-			passlm = ntlm_hash_lm_password(password);
-		if (hashntlm2 || magic_detect || interactivehash) {
-			passntlm2 = ntlm2_hash_password(user, domain, password);
+		if (creds->hashnt || magic_detect || interactivehash)
+			creds->passnt = ntlm_hash_nt_password(password);
+		if (creds->hashlm || magic_detect || interactivehash)
+			creds->passlm = ntlm_hash_lm_password(password);
+		if (creds->hashntlm2 || magic_detect || interactivehash) {
+			creds->passntlm2 = ntlm2_hash_password(cuser, cdomain, password);
 		}
 		memset(password, 0, strlen(password));
 	}
+
+	strcpy(creds->user, cuser, strlen(user));
+	strcpy(creds->domain, cdomain, strlen(cdomain));
+	strcpy(creds->workstation, cworkstation, strlen(cworkstation));
+
+	free(cuser);
+	free(cdomain);
+	free(cworkstation);
+	free(cpassword);
+	free(cpassntlm2);
+	free(cpassnt);
+	free(cpasslm);
+	free(cauth);
 
 	/*
 	 * Try known NTLM auth combinations and print which ones work.
@@ -2757,15 +2753,15 @@ int main(int argc, char **argv) {
 	}
 
 	if (interactivehash) {
-		tmp = printmem(passlm, 16, 8);
+		tmp = printmem(creds->passlm, 16, 8);
 		printf("PassLM          %s\n", tmp);
 		free(tmp);
-		tmp = printmem(passnt, 16, 8);
+		tmp = printmem(creds->passnt, 16, 8);
 		printf("PassNT          %s\n", tmp);
 		free(tmp);
-		if (passntlm2 && strlen(passntlm2)) {
-			tmp = printmem(passntlm2, 16, 8);
-			printf("PassNTLMv2      %s    # Only for user '%s', domain '%s'\n", tmp, user, domain);
+		if (creds->passntlm2 && strlen(creds->passntlm2)) {
+			tmp = printmem(creds->passntlm2, 16, 8);
+			printf("PassNTLMv2      %s    # Only for user '%s', domain '%s'\n", tmp, creds->user, creds->domain);
 			free(tmp);
 		}
 		exit(0);
@@ -2774,7 +2770,7 @@ int main(int argc, char **argv) {
 	/*
 	 * If we're going to need a password, check we really have it.
 	 */
-	if (!ntlmbasic && ((hashnt && !passnt) || (hashlm && !passlm) || (hashntlm2 && !passntlm2))) {
+	if (!ntlmbasic && ((creds->hashnt && !creds->passnt) || (creds->hashlm && !creds->passlm) || (creds->hashntlm2 && !creds->passntlm2))) {
 		syslog(LOG_ERR, "Parent proxy account password (or required hashes) missing.\n");
 		myexit(1);
 	}
@@ -2824,21 +2820,21 @@ int main(int argc, char **argv) {
 	/*
 	 * Check and change UID.
 	 */
-	if (strlen(uid)) {
+	if (strlen(cuid)) {
 		if (getuid() && geteuid()) {
 			syslog(LOG_WARNING, "No root privileges; keeping identity %d:%d\n", getuid(), getgid());
 		} else {
-			if (isdigit(uid[0])) {
-				nuid = atoi(uid);
+			if (isdigit(cuid[0])) {
+				nuid = atoi(cuid);
 				ngid = nuid;
 				if (nuid <= 0) {
 					syslog(LOG_ERR, "Numerical uid parameter invalid\n");
 					myexit(1);
 				}
 			} else {
-				pw = getpwnam(uid);
+				pw = getpwnam(cuid);
 				if (!pw || !pw->pw_uid) {
-					syslog(LOG_ERR, "Username %s in -U is invalid\n", uid);
+					syslog(LOG_ERR, "Username %s in -U is invalid\n", cuid);
 					myexit(1);
 				}
 				nuid = pw->pw_uid;
@@ -2858,9 +2854,9 @@ int main(int argc, char **argv) {
 	 * PID file requested? Try to create one (it must not exist).
 	 * If we fail, exit with error.
 	 */
-	if (strlen(pidfile)) {
+	if (strlen(cpidfile)) {
 		umask(0);
-		cd = open(pidfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		cd = open(cpidfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (cd < 0) {
 			syslog(LOG_ERR, "Error creating a new PID file\n");
 			myexit(1);
@@ -2876,12 +2872,8 @@ int main(int argc, char **argv) {
 	/*
 	 * Free already processed options.
 	 */
-	free(auth);
-	free(uid);
-	free(password);
-	free(cpassntlm2);
-	free(cpassnt);
-	free(cpasslm);
+	free(cpidfile);
+	free(cuid);
 
 	/*
 	 * Change the handler for signals recognized as clean shutdown.
