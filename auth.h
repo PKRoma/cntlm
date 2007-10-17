@@ -23,7 +23,6 @@
 #define _AUTH_H
 
 #include <stdint.h>
-#include "utils.h"
 
 struct auth_s {
 	char *user;
@@ -37,33 +36,6 @@ struct auth_s {
 	int hashlm;
 	uint32_t flags;
 };
-
-struct auth_s *new_auth(void) {
-	struct auth_s *tmp;
-
-	tmp = (struct auth_s *)new(sizeof(struct auth_s));
-	tmp->user = new(MINIBUF_SIZE);
-	tmp->domain = new(MINIBUF_SIZE);
-	tmp->workstation = new(MINIBUF_SIZE);
-	tmp->passlm = new(MINIBUF_SIZE);
-	tmp->passnt = new(MINIBUF_SIZE);
-	tmp->passntlm2 = new(MINIBUF_SIZE);
-
-	return tmp;
-}
-
-void free_auth(struct auth_s *creds) {
-	if (!creds)
-		return;
-
-	free(creds->user);
-	free(creds->domain);
-	free(creds->workstation);
-	free(creds->passlm);
-	free(creds->passnt);
-	free(creds->passntlm2);
-	free(creds);
-}
 
 #define auth_strcpy(creds, var, value) \
 	if ((creds) && (value)) { \
@@ -86,6 +58,8 @@ void free_auth(struct auth_s *creds) {
 		memcpy(((creds)->var), (value), MIN(len, MINIBUF_SIZE)); \
 	} 
 
-struct auth_s *auth_domain(struct auth_s *creds, const char *domain);
+extern struct auth_s *new_auth(void);
+extern void free_auth(struct auth_s *creds);
+extern void dump_auth(struct auth_s *creds);
 
 #endif /* _AUTH_H */

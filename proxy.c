@@ -1661,7 +1661,7 @@ void *process(void *client) {
 	} while (!so_closed(sd) && !so_closed(cd) && !serialize && (keep || so_dataready(cd)));
 
 bailout:
-	auth_free(tcreds);
+	free_auth(tcreds);
 
 	if (debug)
 		printf("\nThread finished.\n");
@@ -2153,8 +2153,7 @@ void carp(const char *msg, int console) {
 
 int main(int argc, char **argv) {
 	char *tmp, *head;
-	char *cpassword, *cpassntlm2, *cpassnt, *cpasslm, *cuid, *cpidfile, *cauth;
-	int cflags;
+	char *cpassword, *cpassntlm2, *cpassnt, *cpasslm, *cuser, *cdomain, *cworkstation, *cuid, *cpidfile, *cauth;
 	struct passwd *pw;
 	struct termios termold, termnew;
 	pthread_attr_t pattr;
@@ -2172,6 +2171,7 @@ int main(int argc, char **argv) {
 	int interactivepwd = 0;
 	int interactivehash = 0;
 	int tracefile = 0;
+	int cflags = 0;
 	plist_t tunneld_list = NULL;
 	plist_t proxyd_list = NULL;
 	plist_t socksd_list = NULL;
@@ -2179,6 +2179,7 @@ int main(int argc, char **argv) {
 	config_t cf = NULL;
 	char *magic_detect = NULL;
 
+	creds = new_auth();
 	cuser = new(MINIBUF_SIZE);
 	cdomain = new(MINIBUF_SIZE);
 	cpassword = new(MINIBUF_SIZE);
@@ -2721,18 +2722,18 @@ int main(int argc, char **argv) {
 		}
 	} else {
 		if (creds->hashnt || magic_detect || interactivehash)
-			creds->passnt = ntlm_hash_nt_password(password);
+			creds->passnt = ntlm_hash_nt_password(cpassword);
 		if (creds->hashlm || magic_detect || interactivehash)
-			creds->passlm = ntlm_hash_lm_password(password);
+			creds->passlm = ntlm_hash_lm_password(cpassword);
 		if (creds->hashntlm2 || magic_detect || interactivehash) {
-			creds->passntlm2 = ntlm2_hash_password(cuser, cdomain, password);
+			creds->passntlm2 = ntlm2_hash_password(cuser, cdomain, cpassword);
 		}
-		memset(password, 0, strlen(password));
+		memset(cpassword, 0, strlen(cpassword));
 	}
 
-	strcpy(creds->user, cuser, strlen(user));
-	strcpy(creds->domain, cdomain, strlen(cdomain));
-	strcpy(creds->workstation, cworkstation, strlen(cworkstation));
+	strncpy(creds->user, cuser, strlen(cuser));
+	strncpy(creds->domain, cdomain, strlen(cdomain));
+	strncpy(creds->workstation, cworkstation, strlen(cworkstation));
 
 	free(cuser);
 	free(cdomain);
@@ -2868,12 +2869,6 @@ int main(int argc, char **argv) {
 		free(tmp);
 		close(cd);
 	}
-
-	/*
-	 * Free already processed options.
-	 */
-	free(cpidfile);
-	free(cuid);
 
 	/*
 	 * Change the handler for signals recognized as clean shutdown.
@@ -3041,6 +3036,9 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	if (strlen(cpidfile))
+		unlink(cpidfile);
+
 	syslog(LOG_INFO, "Terminating with %d active threads\n", tc - tj);
 	pthread_mutex_lock(&connection_mtx);
 	plist_free(connection_list);
@@ -3053,19 +3051,11 @@ int main(int argc, char **argv) {
 	plist_free(socksd_list);
 	plist_free(rules);
 
-	if (strlen(pidfile))
-		unlink(pidfile);
-	if (passntlm2)
-		free(passntlm2);
-	if (passnt)
-		free(passnt);
-	if (passlm)
-		free(passlm);
-
-	free(pidfile);
-	free(user);
-	free(domain);
-	free(workstation);
+	free(cuid);
+	free(cpidfile);
+	free(cuser);
+	free(cdomain);
+	free(cworkstation);
 
 	parent_list = plist_free(parent_list);
 
