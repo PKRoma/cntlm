@@ -1316,18 +1316,10 @@ void *process(void *client) {
 	if (!sd)
 		sd = proxy_connect();
 
-	printf("-------------------------------------\n");
-	dump_auth(creds);
-	tcreds = dup_auth(creds);
-	printf("COPY:-------------------------------------\n");
-	dump_auth(tcreds);
-	printf("-------------------------------------\n");
-
-	if (ntlmbasic) {
-		memset(tcreds->user, 0, MINIBUF_SIZE);
-		memset(tcreds->passntlm2, 0, 16);
-		memset(tcreds->passnt, 0, 21);
-		memset(tcreds->passlm, 0, 21);
+	if (!ntlmbasic) {
+		tcreds = dup_auth(creds, 1);
+	} else {
+		tcreds = dup_auth(creds, 0);
 	}
 
 	if (sd <= 0)
@@ -1415,32 +1407,32 @@ void *process(void *client) {
 				} else {
 					dom = strchr(buf, '\\');
 					if (dom == NULL) {
-						strlcpy(tcreds->user, buf, MIN(MINIBUF_SIZE, pos-buf+1));
+						auth_strncpy(tcreds, user, buf, MIN(MINIBUF_SIZE, pos-buf+1));
 					} else {
-						strlcpy(tcreds->domain, buf, MIN(MINIBUF_SIZE, dom-buf+1));
-						strlcpy(tcreds->user, dom+1, MIN(MINIBUF_SIZE, pos-dom));
+						auth_strncpy(tcreds, domain, buf, MIN(MINIBUF_SIZE, dom-buf+1));
+						auth_strncpy(tcreds, user, dom+1, MIN(MINIBUF_SIZE, pos-dom));
 					}
 
-					if (creds->hashntlm2) {
+					if (tcreds->hashntlm2) {
 						tmp = ntlm2_hash_password(tcreds->user, tcreds->domain, pos+1);
-						memcpy(tcreds->passntlm2, tmp, 16);
+						auth_memcpy(tcreds, passntlm2, tmp, 16);
 						free(tmp);
 					}
 
-					if (creds->hashnt) {
+					if (tcreds->hashnt) {
 						tmp = ntlm_hash_nt_password(pos+1);
-						memcpy(tcreds->passnt, tmp, 21);
+						auth_memcpy(tcreds, passnt, tmp, 21);
 						free(tmp);
 					}
 
-					if (creds->hashlm) {
+					if (tcreds->hashlm) {
 						tmp = ntlm_hash_lm_password(pos+1);
-						memcpy(tcreds->passlm, tmp, 21);
+						auth_memcpy(tcreds, passlm, tmp, 21);
 						free(tmp);
 					}
 
 					if (debug) {
-						printf("NTLM-to-basic: Credentials parsed: %s\\%s at %s\n", tcreds->domain, tcreds->user, creds->workstation);
+						printf("NTLM-to-basic: Credentials parsed: %s\\%s at %s\n", tcreds->domain, tcreds->user, tcreds->workstation);
 					}
 
 					memset(buf, 0, strlen(buf));
@@ -1679,7 +1671,7 @@ bailout:
 		close(sd);
 
 	/*
-	 * Add ourself to the "threads to join" list.
+	 * Add ourselves to the "threads to join" list.
 	 */
 	if (!serialize) {
 		pthread_mutex_lock(&threads_mtx);
@@ -2703,9 +2695,8 @@ int main(int argc, char **argv) {
 				syslog(LOG_ERR, "Invalid PassNTLMv2 hash, terminating\n");
 				exit(1);
 			}
-			memcpy(creds->passntlm2, tmp, 16);
+			auth_memcpy(creds, passntlm2, tmp, 16);
 			memset(creds->passntlm2+16, 0, 5);
-			free(tmp);
 		}
 		if (strlen(cpassnt)) {
 			tmp = scanmem(cpassnt, 8);
@@ -2713,9 +2704,8 @@ int main(int argc, char **argv) {
 				syslog(LOG_ERR, "Invalid PassNT hash, terminating\n");
 				exit(1);
 			}
-			memcpy(creds->passnt, tmp, 16);
+			auth_memcpy(creds, passnt, tmp, 16);
 			memset(creds->passnt+16, 0, 5);
-			free(tmp);
 		}
 		if (strlen(cpasslm)) {
 			tmp = scanmem(cpasslm, 8);
@@ -2723,32 +2713,32 @@ int main(int argc, char **argv) {
 				syslog(LOG_ERR, "Invalid PassLM hash, terminating\n");
 				exit(1);
 			}
-			memcpy(creds->passlm, tmp, 16);
+			auth_memcpy(creds, passlm, tmp, 16);
 			memset(creds->passlm+16, 0, 5);
-			free(tmp);
 		}
 	} else {
 		if (creds->hashnt || magic_detect || interactivehash) {
 			tmp = ntlm_hash_nt_password(cpassword);
-			memcpy(creds->passnt, tmp, 16);
+			auth_memcpy(creds, passnt, tmp, 21);
 			free(tmp);
-		}
-		if (creds->hashlm || magic_detect || interactivehash) {
+		} if (creds->hashlm || magic_detect || interactivehash) {
 			tmp = ntlm_hash_lm_password(cpassword);
-			memcpy(creds->passlm, tmp, 16);
+			auth_memcpy(creds, passlm, tmp, 21);
 			free(tmp);
-		}
-		if (creds->hashntlm2 || magic_detect || interactivehash) {
+		} if (creds->hashntlm2 || magic_detect || interactivehash) {
 			tmp = ntlm2_hash_password(cuser, cdomain, cpassword);
-			memcpy(creds->passntlm2, tmp, 16);
+			auth_memcpy(creds, passntlm2, tmp, 16);
 			free(tmp);
 		}
 		memset(cpassword, 0, strlen(cpassword));
 	}
 
-	strncpy(creds->user, cuser, strlen(cuser));
-	strncpy(creds->domain, cdomain, strlen(cdomain));
-	strncpy(creds->workstation, cworkstation, strlen(cworkstation));
+	auth_strcpy(creds, user, cuser);
+	auth_strcpy(creds, domain, cdomain);
+	auth_strcpy(creds, workstation, cworkstation);
+
+	/* FIXME */
+	dump_auth(creds);
 
 	free(cuser);
 	free(cdomain);
@@ -2765,22 +2755,29 @@ int main(int argc, char **argv) {
 	 */
 	if (magic_detect) {
 		magic_auth_detect(magic_detect);
-		exit(0);
+		printf("EXIT\n");
+		goto bailout;
 	}
 
 	if (interactivehash) {
-		tmp = printmem(creds->passlm, 16, 8);
-		printf("PassLM          %s\n", tmp);
-		free(tmp);
-		tmp = printmem(creds->passnt, 16, 8);
-		printf("PassNT          %s\n", tmp);
-		free(tmp);
-		if (creds->passntlm2 && strlen(creds->passntlm2)) {
+		if (creds->passlm) {
+			tmp = printmem(creds->passlm, 16, 8);
+			printf("PassLM          %s\n", tmp);
+			free(tmp);
+		}
+
+		if (creds->passnt) {
+			tmp = printmem(creds->passnt, 16, 8);
+			printf("PassNT          %s\n", tmp);
+			free(tmp);
+		}
+
+		if (creds->passntlm2) {
 			tmp = printmem(creds->passntlm2, 16, 8);
 			printf("PassNTLMv2      %s    # Only for user '%s', domain '%s'\n", tmp, creds->user, creds->domain);
 			free(tmp);
 		}
-		exit(0);
+		goto bailout;
 	}
 
 	/*
@@ -3051,6 +3048,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
+bailout:
 	if (strlen(cpidfile))
 		unlink(cpidfile);
 
@@ -3068,6 +3066,7 @@ int main(int argc, char **argv) {
 
 	free(cuid);
 	free(cpidfile);
+	free(magic_detect);
 	free_auth(creds);
 
 	parent_list = plist_free(parent_list);

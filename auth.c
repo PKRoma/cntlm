@@ -32,9 +32,9 @@ struct auth_s *new_auth(void) {
 	tmp->user = new(MINIBUF_SIZE);
 	tmp->domain = new(MINIBUF_SIZE);
 	tmp->workstation = new(MINIBUF_SIZE);
-	tmp->passntlm2 = new(MINIBUF_SIZE);
-	tmp->passnt = new(MINIBUF_SIZE);
-	tmp->passlm = new(MINIBUF_SIZE);
+	tmp->passntlm2 = 0;
+	tmp->passnt = 0;
+	tmp->passlm = 0;
 	tmp->hashntlm2 = 1;
 	tmp->hashnt = 0;
 	tmp->hashlm = 0;
@@ -43,13 +43,10 @@ struct auth_s *new_auth(void) {
 	return tmp;
 }
 
-struct auth_s *dup_auth(struct auth_s *creds) {
+struct auth_s *dup_auth(struct auth_s *creds, int fullcopy) {
 	struct auth_s *tmp;
 
-	tmp = (struct auth_s *)new(sizeof(struct auth_s));
-
-	tmp->user = new(MINIBUF_SIZE);
-	strlcpy(tmp->user, creds->user, MINIBUF_SIZE);
+	tmp = new_auth();
 
 	tmp->domain = new(MINIBUF_SIZE);
 	strlcpy(tmp->domain, creds->domain, MINIBUF_SIZE);
@@ -57,19 +54,30 @@ struct auth_s *dup_auth(struct auth_s *creds) {
 	tmp->workstation = new(MINIBUF_SIZE);
 	strlcpy(tmp->workstation, creds->workstation, MINIBUF_SIZE);
 
-	tmp->passntlm2 = new(MINIBUF_SIZE);
-	memcpy(tmp->passntlm2, creds->passntlm2, MINIBUF_SIZE);
-
-	tmp->passnt = new(MINIBUF_SIZE);
-	memcpy(tmp->passnt, creds->passnt, MINIBUF_SIZE);
-
-	tmp->passlm = new(MINIBUF_SIZE);
-	memcpy(tmp->passlm, creds->passlm, MINIBUF_SIZE);
-
 	tmp->hashntlm2 = creds->hashntlm2;
 	tmp->hashnt = creds->hashnt;
 	tmp->hashlm = creds->hashlm;
 	tmp->flags = creds->flags;
+
+	if (fullcopy) {
+		tmp->user = new(MINIBUF_SIZE);
+		strlcpy(tmp->user, creds->user, MINIBUF_SIZE);
+
+		if (creds->passntlm2) {
+			tmp->passntlm2 = new(MINIBUF_SIZE);
+			memcpy(tmp->passntlm2, creds->passntlm2, MINIBUF_SIZE);
+		}
+
+		if (creds->passnt) {
+			tmp->passnt = new(MINIBUF_SIZE);
+			memcpy(tmp->passnt, creds->passnt, MINIBUF_SIZE);
+		}
+
+		if (creds->passlm) {
+			tmp->passlm = new(MINIBUF_SIZE);
+			memcpy(tmp->passlm, creds->passlm, MINIBUF_SIZE);
+		}
+	}
 
 	return tmp;
 }
@@ -78,18 +86,23 @@ void free_auth(struct auth_s *creds) {
 	if (!creds)
 		return;
 
-	free(creds->user);
 	free(creds->domain);
 	free(creds->workstation);
-	free(creds->passlm);
-	free(creds->passnt);
-	free(creds->passntlm2);
+	if (creds->user)
+		free(creds->user);
+	if (creds->passntlm2)
+		free(creds->passntlm2);
+	if (creds->passnt)
+		free(creds->passnt);
+	if (creds->passlm)
+		free(creds->passlm);
 	free(creds);
 }
 
 void dump_auth(struct auth_s *creds) {
 	char *tmp;
 
+	printf("Credentials structure dump:\n");
 	if (!creds) {
 		printf("Struct is not allocated!\n");
 		return;
@@ -102,13 +115,21 @@ void dump_auth(struct auth_s *creds) {
 	printf("HashNT:     %d\n", creds->hashnt);
 	printf("HashLM:     %d\n", creds->hashlm);
 	printf("Flags:      %X\n", creds->flags);
-	tmp = printmem(creds->passntlm2, 16, 8);
-	printf("PassNTLMv2: %s\n", tmp);
-	free(tmp);
-	tmp = printmem(creds->passnt, 16, 8);
-	printf("PassNT:     %s\n", tmp);
-	free(tmp);
-	tmp = printmem(creds->passlm, 16, 8);
-	printf("PassLM:     %s\n", tmp);
-	free(tmp);
+	if (creds->passntlm2) {
+		tmp = printmem(creds->passntlm2, 16, 8);
+		printf("PassNTLMv2: %s\n", tmp);
+		free(tmp);
+	}
+
+	if (creds->passnt) {
+		tmp = printmem(creds->passnt, 16, 8);
+		printf("PassNT:     %s\n", tmp);
+		free(tmp);
+	}
+
+	if (creds->passlm) {
+		tmp = printmem(creds->passlm, 16, 8);
+		printf("PassLM:     %s\n\n", tmp);
+		free(tmp);
+	}
 }

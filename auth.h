@@ -58,9 +58,10 @@ struct auth_s {
 		memcpy(((creds)->var), (value), MIN(len, MINIBUF_SIZE)); \
 	} 
 
+
 extern struct auth_s *new_auth(void);
+extern struct auth_s *dup_auth(struct auth_s *creds, int fullcopy);
 extern void free_auth(struct auth_s *creds);
 extern void dump_auth(struct auth_s *creds);
-extern struct auth_s *dup_auth(struct auth_s *creds);
 
 #endif /* _AUTH_H */
