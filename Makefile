@@ -10,7 +10,7 @@ MANDIR=/usr/local/man
 # Careful now...
 #
 CC=gcc
-OBJS=utils.o ntlm.o xcrypt.o config.o socket.o acl.o proxy.o auth.o
+OBJS=utils.o ntlm.o xcrypt.o config.o socket.o acl.o auth.o http.o proxy.o 
 CFLAGS=$(FLAGS) -g -std=c99 -Wall -pedantic -O3 -D_POSIX_C_SOURCE=200112 -D_ISOC99_SOURCE -D_REENTRANT -DVERSION=\"`cat VERSION`\"
 LDFLAGS=-lpthread
 NAME=cntlm

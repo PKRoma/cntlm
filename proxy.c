@@ -23,9 +23,10 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/time.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -54,11 +55,11 @@
 #include "config.h"
 #include "acl.h"
 #include "auth.h"
+#include "http.h"
 #include "pages.c"
 
 #define DEFAULT_PORT	"3128"
 
-#define BLOCK		2048
 #define SAMPLE		4096
 #define STACK_SIZE	sizeof(void *)*8*1024
 
@@ -86,7 +87,7 @@ static struct auth_s *creds = NULL;			/* throughout the whole module */
 
 static int quit = 0;					/* sighandler() */
 static int asdaemon = 1;				/* myexit() */
-static int ntlmbasic = 0;				/* process() */
+static int ntlmbasic = 0;				/* proxy_thread() */
 static int serialize = 0;
 static int scanner_plugin = 0;
 static long scanner_plugin_maxsize = 0;
@@ -96,14 +97,14 @@ static int active_conns = 0;
 static pthread_mutex_t active_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * List of finished threads. Each thread process() adds itself to it when
+ * List of finished threads. Each thread proxy_thread() adds itself to it when
  * finished. Main regularly joins and removes all tid's in there.
  */
 static plist_t threads_list = NULL;
 static pthread_mutex_t threads_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * List of cached connections. Accessed by each thread process().
+ * List of cached connections. Accessed by each thread proxy_thread().
  */
 static plist_t connection_list = NULL;
 static pthread_mutex_t connection_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -124,12 +125,12 @@ typedef struct {
 /*
  * List of custom header substitutions.
  */
-static hlist_t header_list = NULL;			/* process() */
+static hlist_t header_list = NULL;			/* proxy_thread() */
 static plist_t scanner_agent_list = NULL;		/* scanner_hook() */
-static hlist_t users_list = NULL;			/* socks5() */
+static hlist_t users_list = NULL;			/* socks5_thread() */
 
 /*
- * General signal handler. Fast exit, no waiting for threads and shit.
+ * General signal handler. If in debug mode, quit immediately.
  */
 void sighandler(int p) {
 	if (!quit)
@@ -377,401 +378,6 @@ void tunnel_add(plist_t *list, char *spec, int gateway) {
 }
 
 /*
- * Receive HTTP request/response from the given socket. Fill in pre-allocated
- * rr_data_t structure.
- * Returns: 1 if OK, 0 in case of socket EOF or other error
- */
-int headers_recv(int fd, rr_data_t data) {
-	char *tok, *s3 = 0;
-	int len;
-	char *buf;
-	char *ccode = NULL;
-	char *host = NULL;
-	int i, bsize;
-
-	bsize = BUFSIZE;
-	buf = new(bsize);
-
-	i = so_recvln(fd, &buf, &bsize);
-
-	if (i <= 0)
-		goto bailout;
-
-	if (debug)
-		printf("HEAD: %s", buf);
-
-	/*
-	 * Are we reading HTTP request (from client) or response (from server)?
-	 */
-	trimr(buf);
-	len = strlen(buf);
-	tok = strtok_r(buf, " ", &s3);
-	if (!strncasecmp(buf, "HTTP/", 5) && tok) {
-		data->req = 0;
-		data->http = NULL;
-		data->msg = NULL;
-
-		data->http = substr(tok, 7, 1);
-
-		tok = strtok_r(NULL, " ", &s3);
-		if (tok) {
-			ccode = strdup(tok);
-
-			tok += strlen(ccode);
-			while (tok < buf+len && *tok++ == ' ');
-
-			if (strlen(tok))
-				data->msg = strdup(tok);
-		}
-
-		if (!data->msg)
-			data->msg = strdup("");
-
-		if (!ccode || strlen(ccode) != 3 || (data->code = atoi(ccode)) == 0 || !data->http) {
-			i = -1;
-			goto bailout;
-		}
-	} else if (tok) {
-		data->req = 1;
-		data->method = NULL;
-		data->url = NULL;
-		data->http = NULL;
-
-		data->method = strdup(tok);
-
-		tok = strtok_r(NULL, " ", &s3);
-		if (tok)
-			data->url = strdup(tok);
-
-		tok = strtok_r(NULL, " ", &s3);
-		if (tok)
-			data->http = substr(tok, 7, 1);
-
-		if (!data->url || !data->http) {
-			i = -1;
-			goto bailout;
-		}
-
-		tok = strstr(data->url, "://");
-		if (tok) {
-			s3 = strchr(tok+3, '/');
-			host = substr(tok+3, 0, s3 ? s3-tok-3 : 0);
-		}
-	} else {
-		if (debug)
-			printf("headers_recv: Unknown header (%s).\n", buf);
-		i = -1;
-		goto bailout;
-	}
-
-	/*
-	 * Read in all headers, do not touch any possible HTTP body
-	 */
-	do {
-		i = so_recvln(fd, &buf, &bsize);
-		trimr(buf);
-		if (i > 0 && head_ok(buf)) {
-			data->headers = hlist_add(data->headers, head_name(buf), head_value(buf), 0, 0);
-		}
-	} while (strlen(buf) != 0 && i > 0);
-
-	if (host && !hlist_in(data->headers, "Host"))
-		data->headers = hlist_add(data->headers, "Host", host, 1, 1);
-
-bailout:
-	if (ccode) free(ccode);
-	if (host) free(host);
-	free(buf);
-
-	if (i <= 0) {
-		if (debug)
-			printf("headers_recv: fd %d warning %d (connection closed)\n", fd, i);
-		return 0;
-	}
-
-	return 1;
-}
-
-/*
- * Send HTTP request/response to the given socket based on what's in "data".
- * Returns: 1 if OK, 0 in case of socket error
- */
-int headers_send(int fd, rr_data_t data) {
-	hlist_t t;
-	char *buf;
-	int i, len;
-
-	/*
-	 * First compute required buffer size (avoid realloc, etc)
-	 */
-	if (data->req)
-		len = 20 + strlen(data->method) + strlen(data->url) + strlen(data->http);
-	else
-		len = 20 + strlen(data->http) + strlen(data->msg);
-
-	t = data->headers;
-	while (t) {
-		len += 20 + strlen(t->key) + strlen(t->value);
-		t = t->next;
-	}
-
-	/*
-	 * We know how much memory we need now...
-	 */
-	buf = new(len);
-
-	/*
-	 * Prepare the first request/response line
-	 */
-	len = 0;
-	if (data->req)
-		len = sprintf(buf, "%s %s HTTP/1.%s\r\n", data->method, data->url, data->http);
-	else if (!data->skip_http)
-		len = sprintf(buf, "HTTP/1.%s %03d %s\r\n", data->http, data->code, data->msg);
-
-	/*
-	 * Now add all headers.
-	 */
-	t = data->headers;
-	while (t) {
-		len += sprintf(buf+len, "%s: %s\r\n", t->key, t->value);
-		t = t->next;
-	}
-
-	/*
-	 * Terminate headers
-	 */
-	strcat(buf, "\r\n");
-
-	/*
-	 * Flush it all down the toilet
-	 */
-	if (!so_closed(fd))
-		i = write(fd, buf, len+2);
-	else
-		i = -999;
-
-	free(buf);
-
-	if (i <= 0 || i != len+2) {
-		if (debug)
-			printf("headers_send: fd %d warning %d (connection closed)\n", fd, i);
-		return 0;
-	}
-
-	return 1;
-}
-
-/*
- * Connection cleanup - discard "size" of incomming data.
- */
-int data_drop(int src, int size) {
-	char *buf;
-	int i, block, c = 0;
-
-	if (!size)
-		return 1;
-
-	buf = new(BLOCK);
-	do {
-		block = (size-c > BLOCK ? BLOCK : size-c);
-		i = read(src, buf, block);
-		c += i;
-	} while (i > 0 && c < size);
-
-	free(buf);
-	if (i <= 0) {
-		if (debug)
-			printf("data_drop: fd %d warning %d (connection closed)\n", src, i);
-		return 0;
-	}
-
-	return 1;
-}
-
-/*
- * Forward "size" of data from "src" to "dst". If size == -1 then keep
- * forwarding until src reaches EOF.
- */
-int data_send(int dst, int src, int size) {
-	char *buf;
-	int i, block;
-	int c = 0;
-	int j = 1;
-
-	if (!size)
-		return 1;
-
-	buf = new(BLOCK);
-
-	do {
-		block = (size == -1 || size-c > BLOCK ? BLOCK : size-c);
-		i = read(src, buf, block);
-		
-		if (i > 0)
-			c += i;
-
-		if (debug)
-			printf("data_send: read %d of %d / %d of %d (errno = %s)\n", i, block, c, size, i < 0 ? strerror(errno) : "ok");
-
-		if (so_closed(dst)) {
-			i = -999;
-			break;
-		}
-
-		if (i > 0) {
-			j = write(dst, buf, i);
-
-			if (debug)
-				printf("data_send: wrote %d of %d\n", j, i);
-		}
-
-	} while (i > 0 && j > 0 && (size == -1 || c <  size));
-
-	free(buf);
-
-	if (i <= 0 || j <= 0) {
-		if (i == 0 && j > 0 && (size == -1 || c == size))
-			return 1;
-
-		if (debug)
-			printf("data_send: fds %d:%d warning %d (connection closed)\n", dst, src, i);
-		return 0;
-	}
-
-	return 1;
-}
-
-/*
- * Forward chunked HTTP body from "src" descriptor to "dst".
- */
-int chunked_data_send(int dst, int src) {
-	char *buf;
-	int bsize;
-	int i, csize;
-
-	char *err = NULL;
-
-	bsize = BUFSIZE;
-	buf = new(bsize);
-
-	/* Take care of all chunks */
-	do {
-		i = so_recvln(src, &buf, &bsize);
-		if (i <= 0) {
-			if (debug)
-				printf("chunked_data_send: aborting, read error\n");
-			free(buf);
-			return 0;
-		}
-
-		if (debug)
-			printf("Line: %s", buf);
-
-		/*
-		printf("*buf = ");
-		for (i = 0; i < 100; i++) {
-			printf("%02x ", buf[i]);
-			if (i % 8 == 7)
-				printf("\n       ");
-		}
-		printf("\n");
-		*/
-
-		csize = strtol(buf, &err, 16);
-
-		if (debug)
-			printf("strtol: %d (%x) - err: %s\n", csize, csize, err);
-
-		if (*err != '\r' && *err != '\n' && *err != ';' && *err != ' ' && *err != '\t') {
-			if (debug)
-				printf("chunked_data_send: aborting, chunk size format error\n");
-			free(buf);
-			return 0;
-		}
-
-		if (debug && !csize)
-			printf("last chunk: %d\n", csize);
-
-		write(dst, buf, strlen(buf));
-		if (csize)
-			if (!data_send(dst, src, csize+2)) {
-				if (debug)
-					printf("chunked_data_send: aborting, data_send failed\n");
-
-				free(buf);
-				return 0;
-			}
-
-	} while (csize != 0);
-
-	/* Take care of possible trailer */
-	do {
-		i = so_recvln(src, &buf, &bsize);
-		if (debug)
-			printf("Trailer header(i=%d): %s\n", i, buf);
-		if (i > 0)
-			write(dst, buf, strlen(buf));
-	} while (i > 0 && buf[0] != '\r' && buf[0] != '\n');
-
-	free(buf);
-	return 1;
-}
-
-/*
- * Full-duplex forwarding between proxy and client descriptors.
- * Used for bidirectional HTTP CONNECT connection.
- */
-int tunnel(int cd, int sd) {
-	struct timeval timeout;
-	fd_set set;
-	int i, to, ret, sel;
-	char *buf;
-
-	buf = new(BUFSIZE);
-
-	if (debug)
-		printf("tunnel: select cli: %d, srv: %d\n", cd, sd);
-
-	do {
-		FD_ZERO(&set);
-		FD_SET(cd, &set);
-		FD_SET(sd, &set);
-
-		ret = 1;
-		timeout.tv_sec = 1;
-		timeout.tv_usec = 0;
-
-		sel = select(FD_SETSIZE, &set, NULL, NULL, &timeout);
-		if (sel > 0) {
-			if (FD_ISSET(cd, &set)) {
-				i = cd;
-				to = sd;
-			} else {
-				i = sd;
-				to = cd;
-			}
-
-			ret = read(i, buf, BUFSIZE);
-			if (so_closed(to)) {
-				free(buf);
-				return 0;
-			}
-
-			if (ret > 0);
-				write(to, buf, ret);
-
-		} else if (sel < 0) {
-			free(buf);
-			return 0;
-		}
-	} while (ret > 0);
-
-	free(buf);
-	return 1;
-}
-
-/*
  * Duplicate client request headers, change requested method to HEAD
  * (so we avoid any body transfers during NTLM negotiation), and add
  * proxy authentication request headers.
@@ -780,11 +386,11 @@ int tunnel(int cd, int sd) {
  * NTLM auth message and insert it into the original client header,
  * which is then processed by caller himself.
  *
- * If the immediate reply is an error message, it get stored into
- * error if not NULL, so it can be forwarded to the client. Caller
- * must then free it!
+ * If the proxy closes the connection for some reason, we notify our
+ * caller by setting closed to 1. Otherwise, it is set to 0.
+ * If closed == NULL, we do not signal anything.
  */
-int authenticate(int sd, rr_data_t data, struct auth_s *creds, int silent, int *closed) {
+int authenticate(int sd, rr_data_t request, struct auth_s *creds, int *closed) {
 	char *tmp, *buf, *challenge;
 	rr_data_t auth;
 	int len, rc;
@@ -799,20 +405,20 @@ int authenticate(int sd, rr_data_t data, struct auth_s *creds, int silent, int *
 	to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
 	free(tmp);
 	
-	auth = dup_rr_data(data);
+	auth = dup_rr_data(request);
 
 	/*
 	 * If the request is CONNECT, we keep it unmodified as there are no possible data
 	 * transfers until auth is fully negotiated. All other requests are changed to HEAD.
 	 */
-	if (!CONNECT(data)) {
+	if (!CONNECT(request)) {
 		free(auth->method);
 		auth->method = strdup("GET");
 	}
 	auth->headers = hlist_mod(auth->headers, "Proxy-Authorization", buf, 1);
 	auth->headers = hlist_del(auth->headers, "Content-Length");
 
-	if (debug && !silent) {
+	if (debug) {
 		printf("\nSending auth request...\n");
 		hlist_dump(auth->headers);
 	}
@@ -825,7 +431,7 @@ int authenticate(int sd, rr_data_t data, struct auth_s *creds, int silent, int *
 	free_rr_data(auth);
 	auth = new_rr_data();
 
-	if (debug && !silent)
+	if (debug)
 		printf("Reading auth response...\n");
 
 	if (!headers_recv(sd, auth)) {
@@ -850,7 +456,7 @@ int authenticate(int sd, rr_data_t data, struct auth_s *creds, int silent, int *
 				if (len > 0) {
 					strcpy(buf, "NTLM ");
 					to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
-					data->headers = hlist_mod(data->headers, "Proxy-Authorization", buf, 1);
+					request->headers = hlist_mod(request->headers, "Proxy-Authorization", buf, 1);
 					free(tmp);
 				} else {
 					syslog(LOG_ERR, "No target info block. Cannot do NTLMv2!\n");
@@ -924,7 +530,7 @@ int make_connect(int sd, const char *thost) {
 	if (debug)
 		printf("Starting authentication...\n");
 
-	ret = authenticate(sd, data1, creds, 0, &closed);
+	ret = authenticate(sd, data1, creds, &closed);
 	if (ret && ret != 500) {
 		if (closed || so_closed(sd)) {
 			close(sd);
@@ -995,7 +601,7 @@ int has_body(rr_data_t request, rr_data_t response) {
 	 * Checking complete req+res conversation or just the
 	 * first part when there's no response yet?
 	 */
-	current = (response->http != NULL ? response : request);
+	current = (response->http ? response : request);
 
 	/*
 	 * HTTP body length decisions. There MUST NOT be any body from 
@@ -1197,7 +803,7 @@ int scanner_hook(rr_data_t *request, rr_data_t *response, int *cd, int *sd, long
 					nc = i;
 				} else {
 					nc = proxy_connect();
-					c = authenticate(nc, newreq, creds, 0, NULL);
+					c = authenticate(nc, newreq, creds, NULL);
 					if (c > 0 && c != 500) {
 						if (debug)
 							printf("scanner_hook: Authentication OK, getting the file...\n");
@@ -1286,7 +892,7 @@ int scanner_hook(rr_data_t *request, rr_data_t *response, int *cd, int *sd, long
  * back to client. We loop here to allow proxy keep-alive connections)
  * until the proxy closes.
  */
-void *process(void *client) {
+void *proxy_thread(void *client) {
 	int *rsocket[2], *wsocket[2];
 	int i, loop, bodylen, keep, chunked, plugin, closed;
 	rr_data_t data[2], errdata;
@@ -1498,7 +1104,7 @@ void *process(void *client) {
 			 */
 			if (!loop && data[0]->req && !authok) {
 				errdata = NULL;
-				if (!(i = authenticate(*wsocket[0], data[0], tcreds, 0, &closed)))
+				if (!(i = authenticate(*wsocket[0], data[0], tcreds, &closed)))
 					syslog(LOG_ERR, "Authentication requests failed. Will try without.\n");
 
 				if (!i || closed || so_closed(sd)) {
@@ -1701,7 +1307,7 @@ void *precache_thread(void *data) {
 			data1->url = strdup("http://www.google.com/");
 			data1->http = strdup("1");
 
-			i = authenticate(sd, data1, creds, 1, &closed);
+			i = authenticate(sd, data1, creds, &closed);
 			if (i && i == 1 && !closed && !so_closed(sd) && headers_send(sd, data1) && headers_recv(sd, data2) && data2->code == 302) {
 				tmp = hlist_get(data2->headers, "Content-Length");
 				if (tmp)
@@ -1742,7 +1348,7 @@ void *precache_thread(void *data) {
  * "corkscrew" which after all require us for authentication and tunneling
  *  their HTTP CONNECT in the end.
  */
-void *autotunnel(void *client) {
+void *tunnel_thread(void *client) {
 	int cd = ((struct thread_arg_s *)client)->fd;
 	char *thost = ((struct thread_arg_s *)client)->target;
 	int sd;
@@ -1775,7 +1381,7 @@ void *autotunnel(void *client) {
 	return NULL;
 }
 
-void *socks5(void *client) {
+void *socks5_thread(void *client) {
 	int cd = (int)client;
 	char *tmp, *thost, *tport, *uname, *upass;
 	unsigned char *bs, *auths, *addr;
@@ -1946,7 +1552,7 @@ void *socks5(void *client) {
 	 * Convert the address to character string
 	 */
 	if (ver == 1) {
-		sprintf(thost, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);	/* It's in netword byte order */
+		sprintf(thost, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);	/* It's in network byte order */
 	} else {
 		strlcpy(thost, (char *)addr, MINIBUF_SIZE);
 	}
@@ -2077,7 +1683,7 @@ void magic_auth_detect(const char *url) {
 			return;
 		}
 
-		c = authenticate(nc, req, creds, 0, &closed);
+		c = authenticate(nc, req, creds, &closed);
 		if (c <= 0 || c == 500 || closed) {
 			printf("Auth request ignored (HTTP code: %d)\n", c);
 			free_rr_data(res);
@@ -2961,8 +2567,8 @@ int main(int argc, char **argv) {
 		/*
 		 * Wait here for data (connection request) on any of the listening 
 		 * sockets. When ready, establish the connection. For the main
-		 * port, a new process() thread is spawned to service the HTTP
-		 * request. For tunneled ports, autotunnel() thread is created.
+		 * port, a new proxy_thread() thread is spawned to service the HTTP
+		 * request. For tunneled ports, tunnel_thread() thread is created.
 		 * 
 		 */
 		cd = select(FD_SETSIZE, &set, NULL, NULL, &tv);
@@ -3003,16 +2609,16 @@ int main(int argc, char **argv) {
 
 					if (plist_in(proxyd_list, i)) {
 						if (!serialize)
-							tid = pthread_create(&pthr, &pattr, process, (void *)cd);
+							tid = pthread_create(&pthr, &pattr, proxy_thread, (void *)cd);
 						else
-							process((void *)cd);
+							proxy_thread((void *)cd);
 					} else if (plist_in(socksd_list, i)) {
-						tid = pthread_create(&pthr, &pattr, socks5, (void *)cd);
+						tid = pthread_create(&pthr, &pattr, socks5_thread, (void *)cd);
 					} else {
 						data = (struct thread_arg_s *)new(sizeof(struct thread_arg_s));
 						data->fd = cd;
 						data->target = plist_get(tunneld_list, i);
-						tid = pthread_create(&pthr, &pattr, autotunnel, (void *)data);
+						tid = pthread_create(&pthr, &pattr, tunnel_thread, (void *)data);
 					}
 
 					pthread_attr_destroy(&pattr);
