@@ -1323,9 +1323,8 @@ void *precache_thread(void *data) {
 				sleep(60);
 			}
 		} else {
-			printf("                                                                                                SLEEPING\n");
+			printf("SLEEPING\n");
 			sleep(4);
-			//if (new > 0) {
 			if (active_conns > 0) {
 				new = 0;
 				printf("*************************************************************************\n");
@@ -2303,6 +2302,7 @@ int main(int argc, char **argv) {
 			}
 			auth_memcpy(creds, passntlm2, tmp, 16);
 			memset(creds->passntlm2+16, 0, 5);
+			free(tmp);
 		}
 		if (strlen(cpassnt)) {
 			tmp = scanmem(cpassnt, 8);
@@ -2312,6 +2312,7 @@ int main(int argc, char **argv) {
 			}
 			auth_memcpy(creds, passnt, tmp, 16);
 			memset(creds->passnt+16, 0, 5);
+			free(tmp);
 		}
 		if (strlen(cpasslm)) {
 			tmp = scanmem(cpasslm, 8);
@@ -2321,6 +2322,7 @@ int main(int argc, char **argv) {
 			}
 			auth_memcpy(creds, passlm, tmp, 16);
 			memset(creds->passlm+16, 0, 5);
+			free(tmp);
 		}
 	} else {
 		if (creds->hashnt || magic_detect || interactivehash) {
@@ -2343,9 +2345,6 @@ int main(int argc, char **argv) {
 	auth_strcpy(creds, domain, cdomain);
 	auth_strcpy(creds, workstation, cworkstation);
 
-	/* FIXME */
-	dump_auth(creds);
-
 	free(cuser);
 	free(cdomain);
 	free(cworkstation);
@@ -2361,7 +2360,6 @@ int main(int argc, char **argv) {
 	 */
 	if (magic_detect) {
 		magic_auth_detect(magic_detect);
-		printf("EXIT\n");
 		goto bailout;
 	}
 
