@@ -123,11 +123,12 @@ typedef struct {
 } proxy_t;
 
 /*
- * List of custom header substitutions.
+ * List of custom header substitutions, SOCKS5 proxy users and 
+ * UserAgents for the scanner plugin.
  */
 static hlist_t header_list = NULL;			/* proxy_thread() */
-static plist_t scanner_agent_list = NULL;		/* scanner_hook() */
 static hlist_t users_list = NULL;			/* socks5_thread() */
+static plist_t scanner_agent_list = NULL;		/* scanner_hook() */
 
 /*
  * General signal handler. If in debug mode, quit immediately.
@@ -139,7 +140,7 @@ void sighandler(int p) {
 		syslog(LOG_INFO, "Signal %d received, forcing shutdown\n", p);
 
 	if (quit++ || debug)
-		exit(0);
+		quit++;
 }
 
 void myexit(int rc) {

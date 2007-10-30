@@ -383,9 +383,8 @@ int chunked_data_send(int dst, int src) {
  * Used for bidirectional HTTP CONNECT connection.
  */
 int tunnel(int cd, int sd) {
-	struct timeval timeout;
 	fd_set set;
-	int i, to, ret, sel;
+	int from, to, ret, sel;
 	char *buf;
 
 	buf = new(BUFSIZE);
@@ -398,34 +397,28 @@ int tunnel(int cd, int sd) {
 		FD_SET(cd, &set);
 		FD_SET(sd, &set);
 
-		ret = 1;
-		timeout.tv_sec = 1;
-		timeout.tv_usec = 0;
-
-		sel = select(FD_SETSIZE, &set, NULL, NULL, &timeout);
+		sel = select(FD_SETSIZE, &set, NULL, NULL, NULL);
 		if (sel > 0) {
 			if (FD_ISSET(cd, &set)) {
-				i = cd;
+				from = cd;
 				to = sd;
 			} else {
-				i = sd;
+				from = sd;
 				to = cd;
 			}
 
-			ret = read(i, buf, BUFSIZE);
-			if (so_closed(to)) {
+			ret = read(from, buf, BUFSIZE);
+			if (ret > 0) {
+				ret = write(to, buf, ret);
+			} if (ret <= 0) {
 				free(buf);
-				return 0;
+				return (ret == 0);
 			}
-
-			if (ret > 0);
-				write(to, buf, ret);
-
 		} else if (sel < 0) {
 			free(buf);
 			return 0;
 		}
-	} while (ret > 0);
+	} while (1);
 
 	free(buf);
 	return 1;
