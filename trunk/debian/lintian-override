@@ -1,2 +1,0 @@
-# Use a non-standard permission to help protect passwords
-cntlm binary: non-standard-file-perm etc/cntlm.conf 0600 != 0644
